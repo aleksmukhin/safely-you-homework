@@ -82,3 +82,51 @@ services/             # placeholder
 
 The HTTP contract is defined in [openapi.json](openapi.json); responses
 in `handlers/` follow it.
+
+## Q&A
+
+### How long did you spend working on the problem?
+
+Around 2 hours.
+
+### What did you find to be the most difficult part?
+
+The most difficult part was working with Go itself, since I don't have
+prior experience with it. That included researching syntax, package
+layout, idiomatic best practices, and how core mechanisms
+(goroutines/locks, maps, structs) work in Go.
+
+### Discuss your solution's runtime complexity
+
+The runtime complexity is O(n) per request. I chose a map for the
+in-memory store so device lookups stay O(1), and I avoided nested loops
+in the aggregation paths. I don't currently see meaningful algorithmic
+bottlenecks; the next realistic problem is unbounded in-memory growth,
+not running time.
+
+### How would you modify your data model or code to account for more kinds of metrics?
+
+Right now we have a simple data structure since I only have 2 metrics and
+didn't want to complicate things. This solution works if we have a small
+set of metrics and aren't foreseeing any additions. However, if the number
+of metrics is large, or if we'll be updating them often (for both POST and
+GET), I would want to make it more scalable. Adding a new metric currently
+requires modifying 5 files, which isn't the most extensible solution.
+
+A better approach would be to have a registry of metrics with a validation
+schema per metric, unify the POST endpoint and the DB method, and use a
+schemaless database so the storage layer doesn't need to know each
+metric's shape. When a request comes in, we'd look up the
+metric name in the registry, validate the body shape against the
+registered schema, and push the document to the DB. Adding a new metric
+would become a one-file change. The only real cost is maintaining the
+schemas as the metric count grows — but those are the API contract, so
+we'd want them documented either way.
+
+A similar idea applies to the GET endpoint: each registered metric could
+also carry an aggregation function, and the existing `/stats` endpoint
+would walk the registry to build the response. We may also want to expose
+a per-metric endpoint, or accept a query parameter on `/stats` to specify
+which metrics to include.
+
+
