@@ -3,7 +3,15 @@ package adapters
 import (
 	"fmt"
 	"sync"
+	"time"
 )
+
+type MetricName string
+
+type StoredSample struct {
+	IngestedAt time.Time
+	Body       any
+}
 
 type DeviceDb struct {
 	sync.RWMutex
@@ -11,20 +19,17 @@ type DeviceDb struct {
 }
 
 type DeviceData struct {
-	Heartbeats []DeviceHeartbeat
-	Stats      []DeviceStats
+	Metrics map[MetricName][]StoredSample
 }
 
-type DeviceStats struct {
-	SentAt     string `json:"sent_at"`
-	UploadTime int    `json:"upload_time"`
+func (db *DeviceDb) DeviceExists(deviceID string) bool {
+	db.RLock()
+	defer db.RUnlock()
+	_, ok := db.Devices[deviceID]
+	return ok
 }
 
-type DeviceHeartbeat struct {
-	SentAt string `json:"sent_at"`
-}
-
-func (db *DeviceDb) AddDeviceHeartbeat(deviceID, sentAt string) error {
+func (db *DeviceDb) AddSample(deviceID string, name MetricName, body any) error {
 	db.Lock()
 	defer db.Unlock()
 
@@ -32,36 +37,26 @@ func (db *DeviceDb) AddDeviceHeartbeat(deviceID, sentAt string) error {
 	if !exists {
 		return fmt.Errorf("device not found")
 	}
-
-	device.Heartbeats = append(device.Heartbeats, DeviceHeartbeat{SentAt: sentAt})
-	return nil
-}
-
-func (db *DeviceDb) AddDeviceStats(deviceID, sentAt string, uploadTime int) error {
-	db.Lock()
-	defer db.Unlock()
-
-	device, exists := db.Devices[deviceID]
-	if !exists {
-		return fmt.Errorf("device not found")
+	if device.Metrics == nil {
+		device.Metrics = map[MetricName][]StoredSample{}
 	}
-
-	device.Stats = append(device.Stats, DeviceStats{SentAt: sentAt, UploadTime: uploadTime})
+	device.Metrics[name] = append(device.Metrics[name], StoredSample{
+		IngestedAt: time.Now(),
+		Body:       body,
+	})
 	return nil
 }
 
-func (db *DeviceDb) GetDeviceData(deviceID string) ([]DeviceHeartbeat, []DeviceStats, bool) {
+func (db *DeviceDb) GetSamples(deviceID string, name MetricName) ([]StoredSample, bool) {
 	db.RLock()
 	defer db.RUnlock()
 
 	device, exists := db.Devices[deviceID]
 	if !exists {
-		return nil, nil, false
+		return nil, false
 	}
-
-	heartbeats := make([]DeviceHeartbeat, len(device.Heartbeats))
-	copy(heartbeats, device.Heartbeats)
-	stats := make([]DeviceStats, len(device.Stats))
-	copy(stats, device.Stats)
-	return heartbeats, stats, true
+	samples := device.Metrics[name]
+	out := make([]StoredSample, len(samples))
+	copy(out, samples)
+	return out, true
 }

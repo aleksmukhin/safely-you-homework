@@ -1,10 +1,9 @@
 # Fleet Management Simple Metrics Server
 
-A small Go HTTP service implementing the Fleet Management Metrics coding
-assessment. Devices post heartbeats and per-upload stats; the server returns
-per-device uptime and average upload time on demand.
-
-The full HTTP contract lives in [openapi.json](openapi.json).
+A small Go HTTP service for ingesting per-device metrics (heartbeats,
+upload stats, firmware versions, etc.) and serving aggregated stats on
+demand. Metrics are defined via a registry pattern so adding a new
+metric is a one-file change — see [Architecture](#architecture).
 
 ## Getting started
 
@@ -33,8 +32,8 @@ From the repository root:
 go mod download
 ```
 
-This pulls every module listed in `go.mod` (Gin, validators, etc.) into your
-local module cache. You only need to run this once per checkout.
+This pulls every module listed in `go.mod` (Gin, validators, etc.) into
+your local module cache. You only need to run this once per checkout.
 
 ### 3. Run the server
 
@@ -43,45 +42,143 @@ go run main.go
 ```
 
 The server listens on `127.0.0.1:6733` with all routes mounted under
-`/api/v1`. Devices are bootstrapped from [devices.csv](devices.csv) at
+`/api/v2`. Devices are bootstrapped from [devices.csv](devices.csv) at
 startup. Press `Ctrl-C` to stop.
 
 Quick smoke test (in another terminal):
 
 ```sh
-curl -i http://127.0.0.1:6733/api/v1/devices/60-6b-44-84-dc-64/stats
-# HTTP/1.1 200 OK
-# {"uptime":0,"avg_upload_time":"0s"}
+# POST a heartbeat
+curl -i -X POST http://127.0.0.1:6733/api/v2/devices/60-6b-44-84-dc-64/metrics/heartbeat \
+  -H 'Content-Type: application/json' \
+  -d '{"sent_at":"2026-05-04T10:00:00Z"}'
+# → 204 No Content
+
+# GET aggregated stats for that device (composite — all metrics)
+curl -i http://127.0.0.1:6733/api/v2/devices/60-6b-44-84-dc-64/stats
+# → 200 {"avg_upload_time":"0s","firmware":null,"uptime":100}
+
+# GET a single metric via query parameter
+curl -i 'http://127.0.0.1:6733/api/v2/devices/60-6b-44-84-dc-64/stats?metric=heartbeat'
+# → 200 {"uptime":100}
 ```
-
-### 4. Run the device simulator
-
-The simulator drives traffic against the running server, then compares
-the returned stats to expected values. From the repo root, while the
-server is running:
-
-```sh
-./device-simulator-mac-arm64
-```
-
-Output streams to your terminal; sample output is preserved in
-[results.txt](results.txt).
 
 ## Architecture
 
-The project is split into three layers, each in its own package:
-
 ```
-main.go               # entry point: gin engine, CSV bootstrap, route wiring
-handlers/             # HTTP layer (request/response, OpenAPI conformance)
+main.go           # entry point: Gin engine, CSV bootstrap, route wiring
+handlers/         # HTTP layer
   device_handler.go
-adapters/             # storage layer (in-memory DB)
+adapters/         # storage layer (in-memory DB)
   db.go
-services/             # placeholder
+metrics/          # metric registry + per-metric definitions
+  registry.go     # MetricDef, Register, Lookup, All
+  heartbeat.go    # registers "heartbeat"   → JSON key "uptime"
+  upload_time.go  # registers "upload_time" → JSON key "avg_upload_time"
+  firmware.go     # registers "firmware"    → JSON key "firmware"
+services/         # placeholder
 ```
 
-The HTTP contract is defined in [openapi.json](openapi.json); responses
-in `handlers/` follow it.
+Each non-test source file has a `_test.go` sibling — see
+[Testing](#testing).
+
+### How metrics are added
+
+Each metric is a single file in `metrics/` that declares its body shape
+(with validation tags), parses incoming requests, and aggregates stored
+samples. Registration happens in `init()`, so a new metric becomes a
+one-file change with no edits to handlers, storage, or `main.go`.
+
+```go
+// metrics/firmware.go
+type firmwareBody struct {
+    Version string `json:"version" binding:"required"`
+}
+
+func init() {
+    Register(MetricDef{
+        Name:    "firmware",
+        JSONKey: "firmware",
+        Bind:      /* parse + validate JSON body */,
+        Aggregate: /* compute response value from []StoredSample */,
+    })
+}
+```
+
+Each `StoredSample` carries a server-stamped `IngestedAt` time, so
+metrics that don't include their own timestamp (e.g. `firmware`) can
+still be ordered.
+
+### HTTP endpoints (`/api/v2`)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/devices/:device_id/metrics/:metric_name` | Submit one sample. Body shape is metric-specific. `204` on success. |
+| `GET`  | `/devices/:device_id/stats[?metric=a,b,...]` | Aggregated stats. No `metric` query → all registered metrics. `?metric=x` (or `x,y`) → filtered subset. Returns `200` with a `{<json_key>: <value>}` map. |
+
+Error responses are `{"msg": "..."}` — `404` for unknown device or
+unknown metric, `400` for invalid bodies.
+
+## Testing
+
+```sh
+go test ./...           # quick run, summary per package
+go test -v ./...        # verbose: every test name
+go test -cover ./...    # with coverage
+```
+
+In Go, tests live alongside the code in `_test.go` files. There's no
+separate test folder — the toolchain finds them automatically.
+
+The suite is fast (<1s) and has no external dependencies, so unit and
+integration tests run together. The split below is logical, not
+operational.
+
+### Unit tests
+
+- **[adapters/db_test.go](adapters/db_test.go)** — `AddSample`/`GetSamples`
+  round-trip, `DeviceExists`, unknown-device error paths, copy-on-read
+  isolation (caller mutation can't leak back into storage), and a
+  200-goroutine concurrent writes/reads test that exercises the
+  `sync.RWMutex`.
+- **[metrics/registry_test.go](metrics/registry_test.go)** — register +
+  lookup, `All()` returns entries sorted by name, and confirms all
+  three `init()` registrations are present at startup.
+- **[metrics/heartbeat_test.go](metrics/heartbeat_test.go)** — uptime
+  aggregation: empty input, single sample (returns 100% via the
+  divide-by-zero guard), gap pattern (5 unique buckets / 9-minute span
+  ≈ 55.56%), wrong-type bodies are skipped.
+- **[metrics/upload_time_test.go](metrics/upload_time_test.go)** —
+  averaging 1s/2s/3s = 2s, empty case returns `"0s"`, wrong-type bodies
+  skipped.
+- **[metrics/firmware_test.go](metrics/firmware_test.go)** — empty
+  case, latest-wins ordering, wrong-type case (returns the prior valid
+  version).
+
+### Integration tests
+
+- **[handlers/device_handler_test.go](handlers/device_handler_test.go)**
+  — boots a real Gin engine with the `DeviceHandler` wired against an
+  in-memory `DeviceDb`, then drives the full request/response flow via
+  `net/http/httptest`:
+  - **POST happy paths** — heartbeat, upload_time, and firmware (the
+    last specifically validates that a metric *without* a `sent_at`
+    field is accepted).
+  - **POST error paths** — unknown metric (404), unknown device (404),
+    missing required field (400), malformed JSON (400).
+  - **GET composite** — POSTs three metrics, then asserts the response
+    contains all three JSON keys (`uptime`, `avg_upload_time`,
+    `firmware`).
+  - **GET filtered** — single (`?metric=firmware`) and multiple
+    (`?metric=heartbeat,firmware`) cases.
+  - **GET error paths** — unknown device, unknown metric in query.
+
+> By Go conventions these `httptest`-based handler tests are still
+> unit/package tests because they run in-process with no external
+> services. A *true* integration test would hit a running `:6733`
+> listener or a real database. At this project's size that distinction
+> wouldn't change anything operationally, so the unit/integration split
+> here is named for reviewability.
 
 ## Q&A
 
@@ -106,7 +203,7 @@ not running time.
 
 ### How would you modify your data model or code to account for more kinds of metrics?
 
-Right now we have a simple data structure since I only have 2 metrics and
+~~Right now we have a simple data structure since I only have 2 metrics and
 didn't want to complicate things. This solution works if we have a small
 set of metrics and aren't foreseeing any additions. However, if the number
 of metrics is large, or if we'll be updating them often (for both POST and
@@ -127,6 +224,30 @@ A similar idea applies to the GET endpoint: each registered metric could
 also carry an aggregation function, and the existing `/stats` endpoint
 would walk the registry to build the response. We may also want to expose
 a per-metric endpoint, or accept a query parameter on `/stats` to specify
-which metrics to include.
+which metrics to include.~~
 
+### Indicate if/how you utilized AI tools in the assignment
+I used Cursor to autocomplete certain parts, and I used Claude Code to:
+* generate documentation (architecture, dev docs, OpenAPI doc)
+* generate unit tests
+* generate metrics from existing schemas
+* research Go best practices and explain parts of the syntax
+* generate boilerplate code like error handling in the handlers (according to the specification)
 
+### How would you tackle security, testing and deployment?
+* I added integration and unit tests. I would also add load tests down the road.
+* For security, I would add a middleware to verify that the device sending a request is legitimate, maybe by checking an authorization header (simple solution). I'm sure there's a better way to handle security, especially when we're talking about a large number of connecting devices (I think AWS offers special services for fleet device registration and security).
+* I would go with a simple ECS service (Docker container + Terraform), with minimum resources and horizontal autoscaling set up.
+
+### Possibly include a diagram to illustrate how you would structure an alpha prototype.
+
+```mermaid
+flowchart LR
+    Devices[Fleet of devices] -->|HTTPS| ALB[Application Load Balancer]
+    ALB --> ECS[ECS service<br/>Go metrics server]
+    ECS --> DB[(DynamoDB)]
+    ECS --> Logs[CloudWatch logs + metrics]
+
+    GH[GitHub Actions] -->|build & push| ECR[ECR]
+    ECR -->|deploy| ECS
+```

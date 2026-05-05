@@ -22,11 +22,10 @@ func main() {
 	}
 
 	// register routes
-	v1 := r.Group("/api/v1")
+	v2 := r.Group("/api/v2")
 	{
-		v1.GET("/devices/:device_id/stats", deviceHandler.GetDeviceStats)
-		v1.POST("/devices/:device_id/stats", deviceHandler.PostDeviceStats)
-		v1.POST("/devices/:device_id/heartbeat", deviceHandler.PostDeviceHeartbeat)
+		v2.POST("/devices/:device_id/metrics/:metric_name", deviceHandler.PostMetric)
+		v2.GET("/devices/:device_id/stats", deviceHandler.GetDeviceStats)
 	}
 
 	r.Run(":6733")
@@ -58,8 +57,7 @@ func loadDbFromCSV(filename string) *adapters.DeviceDb {
 	for _, row := range records {
 		deviceID := row[0] 
 		db.Devices[deviceID] = &adapters.DeviceData{
-			Heartbeats: []adapters.DeviceHeartbeat{},
-			Stats:      []adapters.DeviceStats{},
+			Metrics: map[adapters.MetricName][]adapters.StoredSample{},
 		}
 	}
 
